@@ -2,6 +2,8 @@
 
 Self-hosted remote control for OpenCode with a hardened gateway and a native Expo mobile client.
 
+> Alpha status: OpenCode Remote is currently in alpha. Expect rough edges, breaking changes, and incomplete platform coverage.
+
 This project is not affiliated with or endorsed by the OpenCode maintainers. If you publish it under an OpenCode-adjacent name, keep that non-affiliation note in your README and app metadata.
 
 The mobile client uses official OpenCode brand assets from the public OpenCode brand kit for companion positioning, while keeping that non-affiliation note in-product and in project metadata.
