@@ -1,0 +1,58 @@
+{
+  "expo": {
+    "name": "OpenCode Remote",
+    "slug": "opencode-remote",
+    "scheme": "opencode-remote",
+    "version": "0.1.0",
+    "icon": "./assets/brand/opencode-app-icon.png",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow OpenCode Remote to scan pairing QR codes."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow OpenCode Remote to share your approximate city and country with this host."
+        }
+      ],
+      "expo-secure-store",
+      "expo-notifications"
+    ],
+    "splash": {
+      "image": "./assets/brand/opencode-lockup-dark.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#080607"
+    },
+    "ios": {
+      "icon": {
+        "light": "./assets/brand/opencode-app-icon.png",
+        "dark": "./assets/brand/opencode-app-icon.png"
+      },
+      "bundleIdentifier": "ai.opencode.remote",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "ai.opencode.remote",
+      "usesCleartextTraffic": true,
+      "permissions": [
+        "INTERNET",
+        "CAMERA",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/brand/opencode-logomark-light.png",
+        "backgroundColor": "#080607",
+        "monochromeImage": "./assets/brand/opencode-logomark-light.png"
+      }
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "rootDir": "../..",
+    "baseUrl": ".",
+    "paths": {
+      "@opencode-remote/shared": [
+        "../../packages/shared/src/index.ts"
+      ]
+    },
+    "types": [
+      "react",
+      "react-native"
+    ]
+  },
+  "include": [
+    "App.tsx",
+    "src"
+  ]
+}

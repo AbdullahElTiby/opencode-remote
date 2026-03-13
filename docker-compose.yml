@@ -1,0 +1,35 @@
+services:
+  opencode:
+    image: node:24-alpine
+    command: >
+      sh -lc "npm install -g opencode-ai@1.2.24 &&
+      OPENCODE_SERVER_PASSWORD=$${OPENCODE_SERVER_PASSWORD}
+      opencode serve --hostname 0.0.0.0 --port 4096"
+    environment:
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:-change-me}
+    ports:
+      - "127.0.0.1:4096:4096"
+    restart: unless-stopped
+
+  gateway:
+    image: node:24-alpine
+    working_dir: /app
+    command: sh -lc "npm ci && npm run dev --workspace @opencode-remote/gateway"
+    environment:
+      OPENCODE_BASE_URL: http://opencode:4096
+      OPENCODE_PASSWORD: ${OPENCODE_SERVER_PASSWORD:-change-me}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://remote.example.com}
+      JWT_SECRET: ${JWT_SECRET:-change-me}
+      GATEWAY_HOST: 0.0.0.0
+      GATEWAY_PORT: 8787
+    volumes:
+      - ./:/app
+      - gateway-data:/app/data
+    ports:
+      - "8787:8787"
+    depends_on:
+      - opencode
+    restart: unless-stopped
+
+volumes:
+  gateway-data:

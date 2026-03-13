@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.expo/
+.turbo/
+.env
+.env.local
+coverage/
+data/
+*.log
+.downloads/
+.toolchains/
+.opencode/
+tmp/
+*.apk
+tmp-*.png
