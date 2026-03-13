@@ -6,6 +6,7 @@ import Fastify from "fastify"
 import { buildApp } from "../src/app.js"
 import type { AppConfig } from "../src/config.js"
 import type { HostControlSnapshot } from "../src/host-control.js"
+import { emptySavedOpenCodeStateSnapshot } from "../src/opencode-saved-state.js"
 
 const tempDir = path.join(os.tmpdir(), `opencode-remote-test-${Date.now()}`)
 const stateFile = path.join(tempDir, "state.json")
@@ -24,6 +25,36 @@ let hostControlState: HostControlSnapshot = {
 
 beforeAll(async () => {
   await fs.mkdir(tempDir, { recursive: true })
+  const sessionsByDirectory: Record<string, Array<Record<string, unknown>>> = {
+    "/workspace": [
+      {
+        id: "session-1",
+        slug: "remote-demo",
+        directory: "/workspace",
+        title: "Remote demo",
+        summary: { additions: 1, deletions: 0, files: 1 },
+        time: { created: Date.now(), updated: Date.now() },
+      },
+    ],
+    "/workspace-2": [
+      {
+        id: "session-2",
+        slug: "second-project",
+        directory: "/workspace-2",
+        title: "Second project",
+        summary: { additions: 3, deletions: 1, files: 2 },
+        time: { created: Date.now() - 2000, updated: Date.now() - 1000 },
+      },
+    ],
+  }
+  const statusesByDirectory: Record<string, Record<string, { type: "idle" | "busy" }>> = {
+    "/workspace": {
+      "session-1": { type: "idle" },
+    },
+    "/workspace-2": {
+      "session-2": { type: "busy" },
+    },
+  }
   upstream = Fastify()
   upstream.get("/global/health", async () => ({ healthy: true, version: "1.2.24" }))
   upstream.get("/global/event", async (_request: unknown, reply: any) => {
@@ -34,16 +65,19 @@ beforeAll(async () => {
     })
     reply.raw.write(`data: ${JSON.stringify({ type: "session.status", properties: { sessionID: "session-1", status: { type: "idle" } } })}\n\n`)
   })
-  upstream.get("/session", async () => [
-    {
-      id: "session-1",
-      slug: "remote-demo",
-      directory: "/workspace",
-      title: "Remote demo",
-      summary: { additions: 1, deletions: 0, files: 1 },
-      time: { created: Date.now(), updated: Date.now() },
-    },
-  ])
+  upstream.get("/project", async () => ({
+    value: [
+      { id: "project-1", worktree: "/workspace" },
+      { id: "project-2", worktree: "/workspace-2" },
+    ],
+  }))
+  upstream.get("/session", async (request: any) => {
+    const directory = ((request.query as { directory?: string } | undefined) ?? {}).directory
+    if (!directory) {
+      return sessionsByDirectory["/workspace"]
+    }
+    return sessionsByDirectory[directory] ?? []
+  })
   upstream.post("/session", async (request: any) => {
     createdSessions += 1
     const body = (request.body as { directory?: string } | undefined) ?? {}
@@ -55,14 +89,31 @@ beforeAll(async () => {
       time: { created: Date.now(), updated: Date.now() },
     }
   })
-  upstream.get("/session/status", async () => ({
-    "session-1": { type: "idle" },
-  }))
+  upstream.get("/session/status", async (request: any) => {
+    const directory = ((request.query as { directory?: string } | undefined) ?? {}).directory
+    if (!directory) {
+      return statusesByDirectory["/workspace"]
+    }
+    return statusesByDirectory[directory] ?? {}
+  })
   upstream.get("/session/:sessionId", async (request: any) => ({
     id: (request.params as { sessionId: string }).sessionId,
-    slug: (request.params as { sessionId: string }).sessionId === "session-large" ? "large-demo" : "remote-demo",
-    directory: "/workspace",
-    title: (request.params as { sessionId: string }).sessionId === "session-large" ? "Large demo" : "Remote demo",
+    slug:
+      (request.params as { sessionId: string }).sessionId === "session-large"
+        ? "large-demo"
+        : (request.params as { sessionId: string }).sessionId === "session-saved-ref"
+          ? "saved-ref"
+          : "remote-demo",
+    directory:
+      (request.params as { sessionId: string }).sessionId === "session-saved-ref"
+        ? "/workspace-saved-ref"
+        : "/workspace",
+    title:
+      (request.params as { sessionId: string }).sessionId === "session-large"
+        ? "Large demo"
+        : (request.params as { sessionId: string }).sessionId === "session-saved-ref"
+          ? "Saved reference"
+          : "Remote demo",
     summary:
       (request.params as { sessionId: string }).sessionId === "session-large"
         ? { additions: 12000, deletions: 500, files: 400 }
@@ -235,6 +286,9 @@ beforeAll(async () => {
       disconnectHost: async () => {
         disconnectRequests += 1
       },
+    },
+    savedStateReader: {
+      readSnapshot: async () => emptySavedOpenCodeStateSnapshot(),
     },
   })
 })
@@ -594,7 +648,13 @@ describe("gateway pairing flow", () => {
       },
     })
     expect(sessions.statusCode).toBe(200)
-    expect(sessions.json()).toHaveLength(1)
+    expect(sessions.json()).toHaveLength(2)
+    expect(sessions.json()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "session-1", directory: "/workspace" }),
+        expect.objectContaining({ id: "session-2", directory: "/workspace-2" }),
+      ]),
+    )
 
     const refreshed = await app.inject({
       method: "POST",
@@ -605,6 +665,89 @@ describe("gateway pairing flow", () => {
     })
     expect(refreshed.statusCode).toBe(200)
     expect(refreshed.json().refreshToken).not.toBe(tokens.refreshToken)
+  })
+
+  it("merges saved desktop project directories and session references into the mobile session list", async () => {
+    const alternateStateFile = path.join(tempDir, "saved-state-reader.json")
+    const appWithSavedState = await buildApp(
+      {
+        GATEWAY_HOST: "127.0.0.1",
+        GATEWAY_PORT: 8787,
+        PUBLIC_BASE_URL: "http://localhost:8787",
+        OPENCODE_BASE_URL: "http://127.0.0.1:48096",
+        OPENCODE_PASSWORD: undefined,
+        OPENCODE_BIN: "opencode",
+        JWT_SECRET: "test-secret-test-secret",
+        PAIR_CODE_TTL_MS: 300000,
+        ACCESS_TOKEN_TTL_SECONDS: 900,
+        REFRESH_TOKEN_TTL_SECONDS: 2592000,
+        STATE_FILE: alternateStateFile,
+        stateFile: alternateStateFile,
+      },
+      {
+        hostControl: {
+          getSnapshot: async () => ({ ...hostControlState }),
+          setStartupEnabled: async (enabled: boolean) => ({
+            ...hostControlState,
+            startupEnabled: enabled,
+          }),
+          disconnectHost: async () => {
+            disconnectRequests += 1
+          },
+        },
+        savedStateReader: {
+          readSnapshot: async () => ({
+            projectDirectories: ["/workspace-2"],
+            sessionReferences: [
+              {
+                id: "session-saved-ref",
+                directory: "/workspace-saved-ref",
+                updatedAt: Date.now() - 500,
+              },
+            ],
+          }),
+        },
+      },
+    )
+
+    try {
+      const pairStart = await appWithSavedState.inject({
+        method: "POST",
+        url: "/mobile/pair/start",
+        payload: {},
+      })
+      const started = pairStart.json()
+      const pairComplete = await appWithSavedState.inject({
+        method: "POST",
+        url: "/mobile/pair/complete",
+        payload: {
+          challengeId: started.challengeId,
+          code: started.code,
+          deviceName: "Saved state reader",
+          platform: "android",
+        },
+      })
+      const tokens = pairComplete.json()
+
+      const sessions = await appWithSavedState.inject({
+        method: "GET",
+        url: "/mobile/sessions",
+        headers: {
+          authorization: `Bearer ${tokens.accessToken}`,
+        },
+      })
+
+      expect(sessions.statusCode).toBe(200)
+      expect(sessions.json()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "session-1", directory: "/workspace" }),
+          expect.objectContaining({ id: "session-2", directory: "/workspace-2" }),
+          expect.objectContaining({ id: "session-saved-ref", directory: "/workspace-saved-ref" }),
+        ]),
+      )
+    } finally {
+      await appWithSavedState.close()
+    }
   })
 
   it("lists browsable roots and child directories for project creation", async () => {

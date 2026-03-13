@@ -17,6 +17,11 @@ type OpenCodeHealth = {
   version: string
 }
 
+type OpenCodeProjectInfo = {
+  id: string
+  worktree: string
+}
+
 type OpenCodeSessionInfo = {
   id: string
   slug: string
@@ -108,12 +113,20 @@ export class OpenCodeClient {
     return this.requestJson<OpenCodeHealth>("/global/health")
   }
 
-  public async listSessions() {
-    return this.requestJson<OpenCodeSessionInfo[]>("/session")
+  public async listProjects() {
+    const response = await this.requestJson<{ value?: OpenCodeProjectInfo[] } | OpenCodeProjectInfo[]>("/project")
+    if (Array.isArray(response)) {
+      return response
+    }
+    return Array.isArray(response.value) ? response.value : []
   }
 
-  public async sessionStatuses() {
-    return this.requestJson<Record<string, SessionStatus>>("/session/status")
+  public async listSessions(directory?: string) {
+    return this.requestJson<OpenCodeSessionInfo[]>(this.withDirectoryQuery("/session", directory))
+  }
+
+  public async sessionStatuses(directory?: string) {
+    return this.requestJson<Record<string, SessionStatus>>(this.withDirectoryQuery("/session/status", directory))
   }
 
   public async getSession(sessionId: string) {
@@ -464,5 +477,13 @@ export class OpenCodeClient {
     return {
       Authorization: `Basic ${Buffer.from(`opencode:${this.password}`).toString("base64")}`,
     }
+  }
+
+  private withDirectoryQuery(pathname: string, directory?: string) {
+    if (!directory) return pathname
+
+    const url = new URL(pathname, this.baseUrl)
+    url.searchParams.set("directory", directory)
+    return `${url.pathname}${url.search}`
   }
 }

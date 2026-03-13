@@ -1,4 +1,7 @@
+import type { Dirent } from "node:fs"
+import { readdir } from "node:fs/promises"
 import os from "node:os"
+import path from "node:path"
 import Fastify from "fastify"
 import cors from "@fastify/cors"
 import websocket from "@fastify/websocket"
@@ -32,6 +35,13 @@ import { AuthService } from "./auth.js"
 import type { AppConfig } from "./config.js"
 import { NotificationService } from "./notification-service.js"
 import { OpenCodeClient } from "./opencode-client.js"
+import {
+  DesktopSavedStateReader,
+  emptySavedOpenCodeStateSnapshot,
+  type OpenCodeSavedStateReader,
+  type SavedOpenCodeSessionReference,
+  type SavedOpenCodeStateSnapshot,
+} from "./opencode-saved-state.js"
 import { RealtimeHub } from "./realtime-hub.js"
 import { StateStore } from "./state-store.js"
 import { TerminalManager } from "./terminal-manager.js"
@@ -45,6 +55,80 @@ import {
 const MAX_INLINE_DIFF_FILES = 200
 const MAX_INLINE_DIFF_CHANGES = 10_000
 const DIFF_FETCH_TIMEOUT_MS = 2_500
+const DISCOVERY_DIRECTORY_CACHE_TTL_MS = 5 * 60_000
+
+const PROJECT_MARKER_FILE_NAMES = new Set([
+  "opencode.json",
+  "opencode.jsonc",
+])
+
+const PROJECT_MARKER_DIRECTORY_NAMES = new Set([
+  ".opencode",
+])
+
+const SKIPPED_SCAN_DIRECTORY_NAMES = new Set([
+  "$recycle.bin",
+  "system volume information",
+  "windows",
+  "program files",
+  "program files (x86)",
+  "programdata",
+  "recovery",
+  "perflogs",
+  "msocache",
+  "node_modules",
+  ".git",
+  ".hg",
+  ".svn",
+  ".next",
+  "dist",
+  "build",
+  "out",
+  "target",
+  ".expo",
+  ".gradle",
+  "coverage",
+  "vendor",
+  "pods",
+  ".venv",
+  "venv",
+  "__pycache__",
+  "appdata",
+  "temp",
+  "tmp",
+])
+
+type OpenCodeSessionList = Awaited<ReturnType<OpenCodeClient["listSessions"]>>
+type OpenCodeSessionInfo = OpenCodeSessionList[number]
+type OpenCodeStatusMap = Awaited<ReturnType<OpenCodeClient["sessionStatuses"]>>
+type Utf8Dirent = Dirent<string>
+type SessionDiscoveryDirectoryCache = {
+  directories: string[]
+  sessions: OpenCodeSessionList
+  statuses: OpenCodeStatusMap
+  expiresAt: number
+  inFlight: Promise<void> | null
+}
+
+const sessionDiscoveryDirectoryCache: SessionDiscoveryDirectoryCache = {
+  directories: [],
+  sessions: [],
+  statuses: {},
+  expiresAt: 0,
+  inFlight: null,
+}
+
+function emptyOpenCodeStatusMap(): OpenCodeStatusMap {
+  return {}
+}
+
+function resetSessionDiscoveryDirectoryCache() {
+  sessionDiscoveryDirectoryCache.directories = []
+  sessionDiscoveryDirectoryCache.sessions = []
+  sessionDiscoveryDirectoryCache.statuses = {}
+  sessionDiscoveryDirectoryCache.expiresAt = 0
+  sessionDiscoveryDirectoryCache.inFlight = null
+}
 
 function toQrCodeDataUrl(payload: string) {
   return new Promise<string>((resolve, reject) => {
@@ -66,9 +150,300 @@ function toQrCodeDataUrl(payload: string) {
   })
 }
 
-async function buildHostInfo(store: StateStore, opencode: OpenCodeClient, config: AppConfig) {
+async function listKnownProjectDirectories(opencode: OpenCodeClient) {
+  const projects = await opencode.listProjects().catch(() => [])
+  return Array.from(
+    new Set(
+      projects
+        .map((project) => project.worktree?.trim())
+        .filter((worktree): worktree is string => Boolean(worktree)),
+    ),
+  )
+}
+
+function normalizeCandidateDirectory(value: string | null | undefined) {
+  if (typeof value !== "string") return null
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+function isWindowsStyleDirectory(directory: string) {
+  return /^[A-Za-z]:\\/.test(directory) || directory.startsWith("\\\\")
+}
+
+function hasProjectMarker(entries: Utf8Dirent[]) {
+  return entries.some((entry) => {
+    const name = entry.name.toLowerCase()
+    if (entry.isDirectory()) {
+      return PROJECT_MARKER_DIRECTORY_NAMES.has(name)
+    }
+
+    if (!entry.isFile()) return false
+    return PROJECT_MARKER_FILE_NAMES.has(name) || name.endsWith(".sln")
+  })
+}
+
+function shouldSkipScanDirectory(entryName: string) {
+  return SKIPPED_SCAN_DIRECTORY_NAMES.has(entryName.toLowerCase())
+}
+
+async function listAccessibleWindowsDriveRoots(): Promise<string[]> {
+  const roots: string[] = []
+
+  for (let code = 67; code <= 90; code += 1) {
+    const root = `${String.fromCharCode(code)}:\\`
+    try {
+      await readdir(root, { withFileTypes: true, encoding: "utf8" })
+      roots.push(root)
+    } catch {
+      // Ignore unavailable or protected drives.
+    }
+  }
+
+  return roots
+}
+
+async function discoverProjectDirectoriesFromRoot(rootDirectory: string): Promise<string[]> {
+  const discoveredDirectories = new Set<string>()
+  const visitedDirectories = new Set<string>()
+  const pendingDirectories = [rootDirectory]
+
+  while (pendingDirectories.length > 0) {
+    const directory = pendingDirectories.shift()
+    if (!directory || visitedDirectories.has(directory)) continue
+    visitedDirectories.add(directory)
+
+    let entries: Utf8Dirent[]
+    try {
+      entries = await readdir(directory, { withFileTypes: true, encoding: "utf8" })
+    } catch {
+      continue
+    }
+
+    if (hasProjectMarker(entries)) {
+      discoveredDirectories.add(directory)
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue
+      if (shouldSkipScanDirectory(entry.name)) continue
+      pendingDirectories.push(path.join(directory, entry.name))
+    }
+  }
+
+  return Array.from(discoveredDirectories)
+}
+
+async function listSessionDiscoveryDirectories(
+  opencode: OpenCodeClient,
+  savedState: SavedOpenCodeStateSnapshot,
+): Promise<string[]> {
+  const projectDirectories = await listKnownProjectDirectories(opencode)
+  const baseCandidates = new Set<string>()
+  const prioritizedScanRoots = new Set<string>()
+  for (const directory of [...projectDirectories, ...savedState.projectDirectories]) {
+    const normalizedDirectory = normalizeCandidateDirectory(directory)
+    if (!normalizedDirectory) continue
+    baseCandidates.add(normalizedDirectory)
+
+    const parsedDirectory = path.parse(normalizedDirectory)
+    const parentDirectory = normalizeCandidateDirectory(path.dirname(normalizedDirectory))
+    if (!parentDirectory || parentDirectory === normalizedDirectory || parentDirectory === parsedDirectory.root) {
+      continue
+    }
+
+    baseCandidates.add(parentDirectory)
+    prioritizedScanRoots.add(parentDirectory)
+  }
+
+  const homeDirectory = normalizeCandidateDirectory(os.homedir())
+  if (homeDirectory) {
+    baseCandidates.add(homeDirectory)
+    prioritizedScanRoots.add(homeDirectory)
+  }
+
+  if (sessionDiscoveryDirectoryCache.expiresAt <= Date.now() && !sessionDiscoveryDirectoryCache.inFlight) {
+    const shouldScanWindowsDrives = projectDirectories.some(isWindowsStyleDirectory)
+    sessionDiscoveryDirectoryCache.inFlight = (async () => {
+      const discoveredDirectories = new Set<string>()
+      const discoveredSessionMap = new Map<string, OpenCodeSessionInfo>()
+      const discoveredStatusMap: OpenCodeStatusMap = {}
+
+      const mergeDiscoveredSessions = (sessions: OpenCodeSessionList, statuses: OpenCodeStatusMap) => {
+        for (const session of sessions) {
+          const existing = discoveredSessionMap.get(session.id)
+          if (!existing || session.time.updated > existing.time.updated) {
+            discoveredSessionMap.set(session.id, session)
+          }
+        }
+
+        Object.assign(discoveredStatusMap, statuses)
+      }
+
+      for (const rootDirectory of prioritizedScanRoots) {
+        const matches = await discoverProjectDirectoriesFromRoot(rootDirectory)
+        for (const match of matches) {
+          const normalizedDirectory = normalizeCandidateDirectory(match)
+          if (normalizedDirectory) {
+            discoveredDirectories.add(normalizedDirectory)
+          }
+        }
+      }
+
+      sessionDiscoveryDirectoryCache.directories = Array.from(discoveredDirectories)
+
+      if (shouldScanWindowsDrives) {
+        const driveRoots = await listAccessibleWindowsDriveRoots()
+        for (const rootDirectory of driveRoots) {
+          const matches = await discoverProjectDirectoriesFromRoot(rootDirectory)
+          for (const match of matches) {
+            const normalizedDirectory = normalizeCandidateDirectory(match)
+            if (normalizedDirectory) {
+              discoveredDirectories.add(normalizedDirectory)
+            }
+          }
+        }
+      }
+
+      sessionDiscoveryDirectoryCache.directories = Array.from(discoveredDirectories)
+
+      for (const directory of sessionDiscoveryDirectoryCache.directories) {
+        const [sessions, statuses] = await Promise.all([
+          opencode.listSessions(directory).catch(() => []),
+          opencode.sessionStatuses(directory).catch(() => emptyOpenCodeStatusMap()),
+        ])
+        mergeDiscoveredSessions(sessions, statuses)
+      }
+
+      sessionDiscoveryDirectoryCache.sessions = Array.from(discoveredSessionMap.values()).sort(
+        (left, right) => right.time.updated - left.time.updated,
+      )
+      sessionDiscoveryDirectoryCache.statuses = discoveredStatusMap
+      sessionDiscoveryDirectoryCache.expiresAt = Date.now() + DISCOVERY_DIRECTORY_CACHE_TTL_MS
+    })().finally(() => {
+      sessionDiscoveryDirectoryCache.inFlight = null
+    })
+  }
+
+  return Array.from(baseCandidates)
+}
+
+function readNumberProperty(value: unknown, key: string) {
+  if (typeof value !== "object" || value === null) return null
+  const record = value as Record<string, unknown>
+  return typeof record[key] === "number" && Number.isFinite(record[key]) ? record[key] : null
+}
+
+function toRecoveredSessionInfo(
+  value: unknown,
+  fallback: SavedOpenCodeSessionReference,
+): OpenCodeSessionInfo | null {
+  const session = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {}
+  const time = typeof session.time === "object" && session.time !== null ? session.time : null
+  const id = readStringProperty(session, "id") ?? fallback.id
+  const directory = readStringProperty(session, "directory") ?? fallback.directory
+  const title = readStringProperty(session, "title")
+  const slug = readStringProperty(session, "slug") ?? id
+  const createdAt = readNumberProperty(time, "created") ?? fallback.updatedAt
+  const updatedAt = readNumberProperty(time, "updated") ?? fallback.updatedAt
+
+  if (!id || !directory || !title || createdAt === null || updatedAt === null) {
+    return null
+  }
+
+  const summary =
+    typeof session.summary === "object" && session.summary !== null
+      ? {
+          additions: readNumberProperty(session.summary, "additions") ?? 0,
+          deletions: readNumberProperty(session.summary, "deletions") ?? 0,
+          files: readNumberProperty(session.summary, "files") ?? 0,
+        }
+      : undefined
+
+  return {
+    id,
+    slug,
+    directory,
+    title,
+    summary,
+    time: {
+      created: createdAt,
+      updated: updatedAt,
+    },
+  }
+}
+
+async function listAllSessions(
+  opencode: OpenCodeClient,
+  savedStateReader: OpenCodeSavedStateReader,
+): Promise<{ sessions: OpenCodeSessionList; statuses: OpenCodeStatusMap }> {
+  const savedState = await savedStateReader.readSnapshot().catch(() => emptySavedOpenCodeStateSnapshot())
+  const discoveryDirectories = await listSessionDiscoveryDirectories(opencode, savedState)
+  const sessionMap = new Map<string, OpenCodeSessionInfo>()
+  const statusMap: OpenCodeStatusMap = {}
+
+  const mergeSessions = (sessions: OpenCodeSessionList, statuses: OpenCodeStatusMap) => {
+    for (const session of sessions) {
+      const existing = sessionMap.get(session.id)
+      if (!existing || session.time.updated > existing.time.updated) {
+        sessionMap.set(session.id, session)
+      }
+    }
+
+    Object.assign(statusMap, statuses)
+  }
+
+  const [defaultSessions, defaultStatuses] = await Promise.all([
+    opencode.listSessions().catch(() => []),
+    opencode.sessionStatuses().catch(() => emptyOpenCodeStatusMap()),
+  ])
+  mergeSessions(defaultSessions, defaultStatuses)
+
+  await Promise.all(
+    discoveryDirectories.map(async (directory) => {
+      const [sessions, statuses] = await Promise.all([
+        opencode.listSessions(directory).catch(() => []),
+        opencode.sessionStatuses(directory).catch(() => emptyOpenCodeStatusMap()),
+      ])
+      mergeSessions(sessions, statuses)
+    }),
+  )
+
+  mergeSessions(sessionDiscoveryDirectoryCache.sessions, sessionDiscoveryDirectoryCache.statuses)
+
+  await Promise.all(
+    savedState.sessionReferences.map(async (reference) => {
+      if (sessionMap.has(reference.id)) return
+
+      const session = await opencode.getSession(reference.id).catch(() => null)
+      const recovered = toRecoveredSessionInfo(session, reference)
+      if (!recovered) return
+
+      mergeSessions([recovered], emptyOpenCodeStatusMap())
+    }),
+  )
+
+  if (sessionMap.size === 0 && Object.keys(statusMap).length === 0) {
+    return {
+      sessions: [],
+      statuses: emptyOpenCodeStatusMap(),
+    }
+  }
+
+  return {
+    sessions: Array.from(sessionMap.values()).sort((left, right) => right.time.updated - left.time.updated),
+    statuses: statusMap,
+  }
+}
+
+async function buildHostInfo(
+  store: StateStore,
+  opencode: OpenCodeClient,
+  savedStateReader: OpenCodeSavedStateReader,
+  config: AppConfig,
+) {
   const health = await opencode.health().catch(() => null)
-  const statuses = await opencode.sessionStatuses().catch(() => ({}))
+  const { statuses } = await listAllSessions(opencode, savedStateReader)
   return hostInfoSchema.parse({
     hostId: store.getHostId(),
     hostName: os.hostname(),
@@ -145,6 +520,7 @@ function replyWithProjectFilesystemError(error: unknown) {
 type BuildAppDependencies = {
   hostControl?: HostControl
   projectFilesystem?: ProjectFilesystemService
+  savedStateReader?: OpenCodeSavedStateReader
 }
 
 const hostStartupRequestSchema = z.object({
@@ -170,6 +546,7 @@ export async function buildApp(config: AppConfig, dependencies: BuildAppDependen
   })
   const hostControl = dependencies.hostControl ?? new PowerShellHostControl()
   const projectFilesystem = dependencies.projectFilesystem ?? new ProjectFilesystemService()
+  const savedStateReader = dependencies.savedStateReader ?? new DesktopSavedStateReader()
   const hostPageAssets = await loadHostPageAssets()
 
   await app.register(cors, {
@@ -286,8 +663,7 @@ export async function buildApp(config: AppConfig, dependencies: BuildAppDependen
             })
         }
 
-        const sessions = await opencode.listSessions().catch(() => [])
-        const statuses = await opencode.sessionStatuses().catch<Record<string, { type: "idle" }>>(() => ({}))
+        const { sessions, statuses } = await listAllSessions(opencode, savedStateReader)
         const session = sessions.find((item) => item.id === sessionId)
         if (session) {
           hub.broadcast(
@@ -545,7 +921,11 @@ export async function buildApp(config: AppConfig, dependencies: BuildAppDependen
     },
   )
 
-  app.get("/mobile/host", { preHandler: auth.authenticate }, async () => buildHostInfo(store, opencode, config))
+  app.get(
+    "/mobile/host",
+    { preHandler: auth.authenticate },
+    async () => buildHostInfo(store, opencode, savedStateReader, config),
+  )
 
   app.get(
     "/mobile/prompt/options",
@@ -563,7 +943,7 @@ export async function buildApp(config: AppConfig, dependencies: BuildAppDependen
     "/mobile/sessions",
     { preHandler: auth.authenticate },
     async () => {
-      const [sessions, statuses] = await Promise.all([opencode.listSessions(), opencode.sessionStatuses()])
+      const { sessions, statuses } = await listAllSessions(opencode, savedStateReader)
       return sessions.map((session) => {
         const status = ((statuses as Record<string, unknown>)[session.id] as { type: "idle" } | { type: "busy" } | { type: "retry"; attempt: number; message: string; next: number } | undefined) ?? { type: "idle" }
         return sessionSummarySchema.parse(opencode.toSummary(session, status))
@@ -601,6 +981,8 @@ export async function buildApp(config: AppConfig, dependencies: BuildAppDependen
           throw new Error("OpenCode did not return a session id.")
         }
 
+        resetSessionDiscoveryDirectoryCache()
+
         return createProjectResponseSchema.parse({
           sessionId,
           directory: projectDirectory.directory,
@@ -623,12 +1005,13 @@ export async function buildApp(config: AppConfig, dependencies: BuildAppDependen
     { preHandler: auth.authenticate },
     async (request) => {
       const sessionId = (request.params as { sessionId: string }).sessionId
-      const [session, messages, todo, statuses] = await Promise.all([
+      const [session, messages, todo, sessionCollection] = await Promise.all([
         opencode.getSession(sessionId),
         opencode.getMessages(sessionId),
         opencode.getTodo(sessionId),
-        opencode.sessionStatuses(),
+        listAllSessions(opencode, savedStateReader),
       ])
+      const statuses = sessionCollection.statuses
       const sessionInfo = session as {
         id: string
         slug: string
@@ -821,8 +1204,15 @@ export async function buildApp(config: AppConfig, dependencies: BuildAppDependen
     { websocket: true, preHandler: auth.authenticate },
     async (socket) => {
       hub.subscribe(socket)
-      socket.send(JSON.stringify(streamEventSchema.parse({ kind: "host.status", payload: await buildHostInfo(store, opencode, config) })))
-      const [sessions, statuses] = await Promise.all([opencode.listSessions(), opencode.sessionStatuses()])
+      socket.send(
+        JSON.stringify(
+          streamEventSchema.parse({
+            kind: "host.status",
+            payload: await buildHostInfo(store, opencode, savedStateReader, config),
+          }),
+        ),
+      )
+      const { sessions, statuses } = await listAllSessions(opencode, savedStateReader)
       for (const session of sessions) {
         socket.send(
           JSON.stringify(
